@@ -1,13 +1,27 @@
 package main
 
 import (
-	"os"
 	"fmt"
-	"strings"
-	"path/filepath"
 	"io/fs"
 	"math"
+	"os"
+	"path/filepath"
+	"strings"
 )
+
+const THRESOLD = 200
+
+func counter(bow map[string]int) int {
+	total := 0
+	for _, freq := range bow {
+		if freq < THRESOLD {
+			continue
+		}
+		total += freq
+	}
+
+	return total
+}
 
 func tokenize(message string) []string {
 	tokens := strings.Fields(message)
@@ -18,7 +32,7 @@ func tokenize(message string) []string {
 	return tokens
 }
 
-func fileToBow(path string, bow map[string]int) (error) {
+func fileToBow(path string, bow map[string]int) error {
 	content, err := os.ReadFile(path)
 	if err != nil {
 		return err
@@ -32,9 +46,26 @@ func fileToBow(path string, bow map[string]int) (error) {
 	return nil
 }
 
-func BagOfWords(root string) (map[string]int, error) {
-	bow := map[string]int{}
-	err := filepath.WalkDir(root, func (path string, d fs.DirEntry, err error) (error) {
+func docProbabilityOverClass(ham, spam map[string]int, path string, totalHam, totalSpam, vocabSize int) (float64, float64, error) {
+	content, err := os.ReadFile(path)
+	if err != nil {
+		return 0, 0, err
+	}
+
+	tokens := tokenize(string(content))
+	hamProb := 0.0
+	spamProb := 0.0
+
+	for _, token := range tokens {
+		hamProb += math.Log(float64(ham[token]+1) / float64(totalHam+vocabSize))
+		spamProb += math.Log(float64(spam[token]+1) / float64(totalSpam+vocabSize))
+	}
+
+	return hamProb, spamProb, nil
+}
+
+func BagOfWords(root string, bow map[string]int) error {
+	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
@@ -51,64 +82,110 @@ func BagOfWords(root string) (map[string]int, error) {
 		return nil
 	})
 	if err != nil {
-		return map[string]int{}, err
+		return err
 	}
-	return bow, nil
+	return nil
+}
+
+func getVocabSize(ham, spam map[string]int) int {
+	vocab := map[string]struct{}{}
+	for word := range ham {
+		vocab[word] = struct{}{}
+	}
+
+	for word := range spam {
+		vocab[word] = struct{}{}
+	}
+
+	return len(vocab)
 }
 
 func main() {
-	BowHam, err := BagOfWords("./enron1/ham/")
-	if err != nil {
-		panic(err)
-	}
-	BowSpam, err := BagOfWords("./enron1/spam/")
-	if err != nil {
-		panic(err)
-	}
+	fmt.Printf("Training...\n")
+	BowHam := map[string]int{}
+	BowSpam := map[string]int{}
 
-	totalHam := 0
-	for _, freq := range BowHam {
-		totalHam += freq
-	}
-
-	totalSpam := 0
-	for _, freq := range BowSpam {
-		totalSpam += freq
-	}
-
-	EmailBow := map[string]int{}
-
-	err = fileToBow("./enron2/ham/0004.1999-12-10.kaminski.ham.txt", EmailBow)
-	if err != nil {
-		panic(err)
-	}
-
-	prob_of_doc_ham := 0.0
-	prob_of_doc_spam := 0.0
-
-	for token := range EmailBow {
-		if BowHam[token] == 0 {
-			fmt.Printf("Ignored %v\n", token)
-			continue
+	for i := 1; i <= 5; i += 1 {
+		path := fmt.Sprintf("./training_data/enron%v/%v/", i, "ham")
+		err := BagOfWords(path, BowHam)
+		if err != nil {
+			panic(err)
 		}
-		p := math.Log(float64(BowHam[token])/float64(totalHam))
-		prob_of_doc_ham += p
-		fmt.Printf("%v => %v\n", token, p)
-	}
-
-	for token := range EmailBow {
-		if BowSpam[token] == 0 {
-			fmt.Printf("Ignored %v\n", token)
-			continue
+		path = fmt.Sprintf("./training_data/enron%v/%v/", i, "spam")
+		err = BagOfWords(path, BowSpam)
+		if err != nil {
+			panic(err)
 		}
-		p := math.Log(float64(BowSpam[token])/float64(totalSpam))
-		prob_of_doc_spam += p
-		fmt.Printf("%v => %v\n", token, p)
 	}
 
-	fmt.Printf("probability of document(HAM): %v\n", prob_of_doc_ham)
-	fmt.Printf("probability of document(SPAM): %v\n", prob_of_doc_spam)
+	totalHam := counter(BowHam)
+	totalSpam := counter(BowSpam)
+	total := totalHam + totalSpam
+	ogHam := float64(totalHam) / float64(total)
+	ogSpam := float64(totalSpam) / float64(total)
+	hamHamCount := 0
+	spamHamCount := 0
+	hamSpamCount := 0
+	spamSpamCount := 0
 
-	fmt.Printf("len(ham) == %v\n", len(BowHam))
-	fmt.Printf("len(spam) == %v\n", len(BowSpam))
+	vocabSize := getVocabSize(BowHam, BowSpam)
+
+	fmt.Printf("classifying ham...\n")
+	err := filepath.WalkDir("./training_data/enron6/ham/", func(path string, d fs.DirEntry, err error) error {
+		if d.IsDir() || err != nil {
+			return nil
+		}
+
+		hamProb, spamProb, err := docProbabilityOverClass(BowHam, BowSpam, path, totalHam, totalSpam, vocabSize)
+		if err != nil {
+			return err
+		}
+
+		hp := math.Log(ogHam) + hamProb
+		sp := math.Log(ogSpam) + spamProb
+
+		if hp > sp {
+			hamHamCount += 1
+		} else {
+			spamHamCount += 1
+		}
+
+		return nil
+
+	})
+	if err != nil {
+		panic(err)
+	}
+
+	fmt.Printf("	Ham: %v\n", hamHamCount)
+	fmt.Printf("	Spam: %v\n", spamHamCount)
+
+	fmt.Printf("classifying spam...\n")
+	err = filepath.WalkDir("./training_data/enron6/spam/", func(path string, d fs.DirEntry, err error) error {
+		if d.IsDir() || err != nil {
+			return nil
+		}
+
+		hamProb, spamProb, err := docProbabilityOverClass(BowHam, BowSpam, path, totalHam, totalSpam, vocabSize)
+		if err != nil {
+			return err
+		}
+
+		hp := math.Log(ogHam) + hamProb
+		sp := math.Log(ogSpam) + spamProb
+
+		if hp > sp {
+			hamSpamCount += 1
+		} else {
+			spamSpamCount += 1
+		}
+
+		return nil
+
+	})
+	if err != nil {
+		panic(err)
+	}
+	fmt.Printf("	Ham: %v\n", hamSpamCount)
+	fmt.Printf("	Spam: %v\n", spamSpamCount)
 }
